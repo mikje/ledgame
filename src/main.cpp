@@ -3,6 +3,9 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 
+//Vergeet niet de tankslang los te maken!
+
+
 // Access Point configuratie
 const char* ssid = "Ledstrip_Game";
 const char* password = "12345678";
