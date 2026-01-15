@@ -3,7 +3,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 
-//Vergeet niet de tankslang los te maken!
+// de opmerking is weg
 
 
 // Access Point configuratie
