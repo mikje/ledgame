@@ -4,6 +4,324 @@
 #include <ESPAsyncWebServer.h>
 #include <HardwareSerial.h>
 #include <DFRobotDFPlayerMini.h>
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEClient.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+// ─── Instellingen ─────────────────────────────────────────────────────────────
+static const char*   DEVICE_MAC  = "7c:f9:61:b7:cc:ff";
+static const int     W           = 64;
+static const int     H           = 16;
+static const uint8_t BRIGHTNESS  = 70;
+
+// ─── BLE UUIDs ────────────────────────────────────────────────────────────────
+static BLEUUID SERVICE_UUID((uint16_t)0x00FA);
+static BLEUUID WRITE_UUID  ((uint16_t)0xFA02);
+static BLEUUID NOTIFY_UUID ((uint16_t)0xFA03);
+
+// ─── Handshake bytes ──────────────────────────────────────────────────────────
+static const uint8_t HANDSHAKE_1[] = {0x08,0x00,0x01,0x80,0x0E,0x06,0x32,0x00};
+static const uint8_t HANDSHAKE_2[] = {0x04,0x00,0x05,0x80};
+
+// ─── Colors ───────────────────────────────────────────────────────────────────
+struct Color { uint8_t r, g, b; };
+static const Color COL_BLACK  = {0,   0,   0  };
+static const Color COL_CYAN   = {0,   200, 255};
+static const Color COL_GREEN  = {0,   220, 80 };
+static const Color COL_YELLOW = {255, 200, 0  };
+static const Color COL_GRAY   = {80,  80,  80 };
+static const Color COL_RED    = {220, 0,   0  };
+
+// ─── Globale staat ────────────────────────────────────────────────────────────
+BLEClient*                bleClient  = nullptr;
+BLERemoteCharacteristic*  writeChr   = nullptr;
+BLERemoteCharacteristic*  notifyChr  = nullptr;
+
+volatile bool    connected        = false;
+volatile bool    handshakeDone    = false;
+volatile uint8_t hsStage          = 0;
+volatile bool    frameAck         = true;
+
+// Acties die vanuit loop() uitgevoerd worden (niet vanuit BLE callback)
+volatile bool    doSendHS2        = false;
+volatile bool    doSendBrightness = false;
+
+float temp_ = NAN;
+float ph_   = NAN;
+float orp_  = NAN;
+
+// ─── CRC32 ────────────────────────────────────────────────────────────────────
+static uint32_t crc32_byte(uint32_t crc, uint8_t b) {
+  crc ^= b;
+  for (int i = 0; i < 8; i++) crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1));
+  return crc;
+}
+static uint32_t crc32(const uint8_t* d, size_t n, uint32_t init = 0xFFFFFFFF) {
+  for (size_t i = 0; i < n; i++) init = crc32_byte(init, d[i]);
+  return init;
+}
+
+// ─── Helper: push integers ────────────────────────────────────────────────────
+static void push_u16le(std::vector<uint8_t>& v, uint16_t x) {
+  v.push_back(x & 0xFF); v.push_back(x >> 8);
+}
+static void push_u32be(std::vector<uint8_t>& v, uint32_t x) {
+  v.push_back(x>>24); v.push_back(x>>16); v.push_back(x>>8); v.push_back(x);
+}
+static void push_u32le(std::vector<uint8_t>& v, uint32_t x) {
+  v.push_back(x); v.push_back(x>>8); v.push_back(x>>16); v.push_back(x>>24);
+}
+
+// ─── PNG chunk ────────────────────────────────────────────────────────────────
+static void png_chunk(std::vector<uint8_t>& out, const char* tag,
+                      const uint8_t* data, size_t len) {
+  push_u32be(out, (uint32_t)len);
+  uint8_t t[4]={(uint8_t)tag[0],(uint8_t)tag[1],(uint8_t)tag[2],(uint8_t)tag[3]};
+  uint32_t c = crc32(t, 4);
+  if (len > 0) c = crc32(data, len, c);
+  c ^= 0xFFFFFFFF;
+  out.insert(out.end(), t, t+4);
+  if (len > 0) out.insert(out.end(), data, data+len);
+  push_u32be(out, c);
+}
+
+// ─── DEFLATE ──────────────────────────────────────────────────────────────────
+struct BitBuf {
+  std::vector<uint8_t> out;
+  uint32_t bits{0}; int nbits{0};
+  void put(uint32_t val, int n) {
+    bits |= (val&((1u<<n)-1))<<nbits; nbits+=n;
+    while(nbits>=8){out.push_back(bits&0xFF);bits>>=8;nbits-=8;}
+  }
+  void flush(){if(nbits>0){out.push_back(bits&0xFF);bits=0;nbits=0;}}
+};
+static uint32_t rev(uint32_t v,int n){uint32_t r=0;for(int i=0;i<n;i++){r=(r<<1)|(v&1);v>>=1;}return r;}
+static void emit_lit(BitBuf& bb,uint8_t b){if(b<=143)bb.put(rev(0x30+b,8),8);else bb.put(rev(0x190+(b-144),9),9);}
+static void emit_eob(BitBuf& bb){bb.put(rev(0,7),7);}
+
+static void emit_ref(BitBuf& bb,int len,int dist){
+  struct LC{int sym,eb,base;};
+  LC lc;
+  if(len<=10)lc={257+len-3,0,len};
+  else if(len<=12)lc={265,1,11};else if(len<=14)lc={266,1,13};
+  else if(len<=16)lc={267,1,15};else if(len<=18)lc={268,1,17};
+  else if(len<=22)lc={269,2,19};else if(len<=26)lc={270,2,23};
+  else if(len<=30)lc={271,2,27};else if(len<=34)lc={272,2,31};
+  else if(len<=42)lc={273,3,35};else if(len<=50)lc={274,3,43};
+  else if(len<=58)lc={275,3,51};else if(len<=66)lc={276,3,59};
+  else if(len<=82)lc={277,4,67};else if(len<=98)lc={278,4,83};
+  else if(len<=114)lc={279,4,99};else if(len<=130)lc={280,4,115};
+  else if(len<=162)lc={281,5,131};else if(len<=194)lc={282,5,163};
+  else if(len<=226)lc={283,5,195};else if(len<=257)lc={284,5,227};
+  else lc={285,0,258};
+  if(lc.sym<=279)bb.put(rev(lc.sym-256,7),7);else bb.put(rev(0xC0+(lc.sym-280),8),8);
+  if(lc.eb>0)bb.put(len-lc.base,lc.eb);
+  int dc,de,db;
+  if(dist==1){dc=0;de=0;db=1;}else if(dist==2){dc=1;de=0;db=2;}
+  else if(dist==3){dc=2;de=0;db=3;}else if(dist==4){dc=3;de=0;db=4;}
+  else if(dist<=6){dc=4;de=1;db=5;}else if(dist<=8){dc=5;de=1;db=7;}
+  else if(dist<=12){dc=6;de=2;db=9;}else if(dist<=16){dc=7;de=2;db=13;}
+  else if(dist<=24){dc=8;de=3;db=17;}else if(dist<=32){dc=9;de=3;db=25;}
+  else if(dist<=48){dc=10;de=4;db=33;}else if(dist<=64){dc=11;de=4;db=49;}
+  else if(dist<=96){dc=12;de=5;db=65;}else if(dist<=128){dc=13;de=5;db=97;}
+  else if(dist<=192){dc=14;de=6;db=129;}else if(dist<=256){dc=15;de=6;db=193;}
+  else if(dist<=384){dc=16;de=7;db=257;}else if(dist<=512){dc=17;de=7;db=385;}
+  else if(dist<=768){dc=18;de=8;db=513;}else{dc=19;de=8;db=769;}
+  bb.put(rev(dc,5),5);if(de>0)bb.put(dist-db,de);
+}
+
+static std::vector<uint8_t> deflate_compress(const std::vector<uint8_t>& raw){
+  const int HSIZE=4096,MAX_DIST=4096,MAX_LEN=128;
+  std::vector<int> head(HSIZE,-1),prev(raw.size(),-1);
+  auto hash3=[&](size_t i)->int{return((raw[i]*31337+raw[i+1]*1337+raw[i+2])&(HSIZE-1));};
+  BitBuf bb; bb.put(1,1);bb.put(1,2);
+  size_t i=0,n=raw.size();
+  while(i<n){
+    if(i+3<=n){
+      int h=hash3(i),best_len=2,best_dist=0,j=head[h],steps=0;
+      while(j>=0&&(int)i-j<=MAX_DIST&&steps<32){
+        int ml=0;
+        while(ml<MAX_LEN&&i+ml<n&&raw[i+ml]==raw[j+ml])ml++;
+        if(ml>best_len){best_len=ml;best_dist=(int)i-j;}
+        j=prev[j];steps++;
+      }
+      prev[i]=head[h];head[h]=(int)i;
+      if(best_len>=3&&best_dist>0){
+        emit_ref(bb,best_len,best_dist);
+        for(int k=1;k<best_len;k++)
+          if(i+k+3<=n){int hk=hash3(i+k);prev[i+k]=head[hk];head[hk]=(int)(i+k);}
+        i+=best_len;continue;
+      }
+    }
+    emit_lit(bb,raw[i]);i++;
+  }
+  emit_eob(bb);bb.flush();return bb.out;
+}
+
+// ─── PNG generatie ────────────────────────────────────────────────────────────
+static std::vector<uint8_t> make_png(const Color* px,int w,int h){
+  std::vector<uint8_t> raw;raw.reserve((size_t)h*(1+w*3));
+  for(int y=0;y<h;y++){raw.push_back(0);for(int x=0;x<w;x++){raw.push_back(px[y*w+x].r);raw.push_back(px[y*w+x].g);raw.push_back(px[y*w+x].b);}}
+  auto deflated=deflate_compress(raw);
+  uint32_t s1=1,s2=0;for(uint8_t b:raw){s1=(s1+b)%65521;s2=(s2+s1)%65521;}
+  std::vector<uint8_t> zs;zs.push_back(0x78);zs.push_back(0x9C);
+  zs.insert(zs.end(),deflated.begin(),deflated.end());push_u32be(zs,(s2<<16)|s1);
+  std::vector<uint8_t> png;
+  const uint8_t sig[]={0x89,'P','N','G','\r','\n',0x1a,'\n'};png.insert(png.end(),sig,sig+8);
+  uint8_t ihdr[13]={(uint8_t)(w>>24),(uint8_t)(w>>16),(uint8_t)(w>>8),(uint8_t)w,
+                    (uint8_t)(h>>24),(uint8_t)(h>>16),(uint8_t)(h>>8),(uint8_t)h,8,2,0,0,0};
+  png_chunk(png,"IHDR",ihdr,13);png_chunk(png,"IDAT",zs.data(),zs.size());png_chunk(png,"IEND",nullptr,0);
+  return png;
+}
+
+// ─── Frame wrapper ────────────────────────────────────────────────────────────
+static std::vector<uint8_t> build_frame(const std::vector<uint8_t>& png){
+  uint16_t dlen=(uint16_t)png.size(),tlen=dlen+15;
+  uint32_t c=crc32(png.data(),png.size())^0xFFFFFFFF;
+  std::vector<uint8_t> f;push_u16le(f,tlen);
+  f.push_back(0x02);f.push_back(0x00);f.push_back(0x00);
+  push_u16le(f,dlen);f.push_back(0x00);f.push_back(0x00);
+  push_u32le(f,c);f.push_back(0x00);f.push_back(0x65);
+  f.insert(f.end(),png.begin(),png.end());return f;
+}
+
+// ─── Framebuffer + font ───────────────────────────────────────────────────────
+Color fb[H][W];
+
+static const uint8_t FONT_DIGITS[10][5]={
+  {0b111,0b101,0b101,0b101,0b111},{0b010,0b110,0b010,0b010,0b111},
+  {0b111,0b001,0b111,0b100,0b111},{0b111,0b001,0b111,0b001,0b111},
+  {0b101,0b101,0b111,0b001,0b001},{0b111,0b100,0b111,0b001,0b111},
+  {0b111,0b100,0b111,0b101,0b111},{0b111,0b001,0b001,0b001,0b001},
+  {0b111,0b101,0b111,0b101,0b111},{0b111,0b101,0b111,0b001,0b111},
+};
+static const uint8_t FONT_COLON[5] ={0b000,0b010,0b000,0b010,0b000};
+static const uint8_t FONT_DOT[5]   ={0b000,0b000,0b000,0b000,0b010};
+static const uint8_t FONT_MINUS[5] ={0b000,0b000,0b111,0b000,0b000};
+static const uint8_t FONT_DEGREE[5]={0b110,0b110,0b000,0b000,0b000};
+static const uint8_t FONT_LETTERS[8][5]={
+  {0b111,0b010,0b010,0b010,0b010},{0b111,0b100,0b111,0b100,0b111},
+  {0b101,0b111,0b101,0b101,0b101},{0b111,0b101,0b111,0b100,0b100},
+  {0b101,0b101,0b111,0b101,0b101},{0b111,0b101,0b101,0b101,0b111},
+  {0b111,0b101,0b111,0b110,0b101},{0b111,0b100,0b100,0b100,0b111},
+};
+
+void fb_clear(Color c=COL_BLACK){for(int y=0;y<H;y++)for(int x=0;x<W;x++)fb[y][x]=c;}
+void fb_set(int x,int y,Color c){if(x>=0&&x<W&&y>=0&&y<H)fb[y][x]=c;}
+void draw_glyph(int x,int y,const uint8_t g[5],Color col){for(int r=0;r<5;r++){uint8_t b=g[r];for(int c=0;c<3;c++)if(b&(0x4>>c))fb_set(x+c,y+r,col);}}
+int draw_char(int x,int y,char c,Color col){
+  if(c>='0'&&c<='9'){draw_glyph(x,y,FONT_DIGITS[c-'0'],col);return 4;}
+  if(c==':'){draw_glyph(x,y,FONT_COLON,col);return 2;}
+  if(c=='.'){draw_glyph(x,y,FONT_DOT,col);return 2;}
+  if(c=='-'){draw_glyph(x,y,FONT_MINUS,col);return 4;}
+  if(c=='~'){draw_glyph(x,y,FONT_DEGREE,col);return 4;}
+  const char* letters="TEMPHОRC";
+  for(int i=0;i<8;i++)if(c==letters[i]){draw_glyph(x,y,FONT_LETTERS[i],col);return 4;}
+  return 4;
+}
+void draw_string(int x,int y,const char* s,Color col){while(*s){x+=draw_char(x,y,*s,col);s++;}}
+void draw_value_right(int cx,int cw,int y,const char* s,Color col){
+  int w=0;for(const char* p=s;*p;p++)w+=(*p==':'||*p=='.')?2:4;
+  draw_string(cx+cw-w,y,s,col);
+}
+
+// ─── Frame bouwen ─────────────────────────────────────────────────────────────
+std::vector<uint8_t> make_display_frame(){
+  fb_clear(COL_BLACK);char buf[16];
+
+  // Temperatuur
+  Color tc=COL_CYAN;bool tv=!isnan(temp_);
+  if(tv){if(temp_>35||temp_<10)tc=COL_RED;snprintf(buf,sizeof(buf),"%.1f",temp_);
+    draw_char(4,1,buf[0],tc);draw_char(8,1,buf[1],tc);
+    draw_char(11,1,'.',tc);draw_char(14,1,buf[3],tc);draw_char(18,1,'~',tc);
+  }else{draw_char(6,1,'-',tc);draw_char(10,1,'-',tc);}
+  draw_string(4,9,"TEMP",COL_GRAY);
+
+  // pH
+  Color pc=COL_GREEN;bool pv=!isnan(ph_);
+  if(pv){if(ph_<7.0||ph_>7.6)pc=COL_RED;snprintf(buf,sizeof(buf),"%.1f",ph_);
+    draw_char(28,1,buf[0],pc);draw_char(31,1,'.',pc);draw_char(34,1,buf[2],pc);
+  }else{draw_char(28,1,'-',pc);draw_char(32,1,'-',pc);}
+  draw_string(29,9,"PH",COL_GRAY);
+
+  // ORP
+  Color oc=COL_YELLOW;
+  if(!isnan(orp_)){if(orp_<650||orp_>800)oc=COL_RED;snprintf(buf,sizeof(buf),"%d",(int)orp_);}
+  else snprintf(buf,sizeof(buf),"---");
+  draw_value_right(39,21,1,buf,oc);
+  draw_string(48,9,"ORP",COL_GRAY);
+
+  auto png=make_png(&fb[0][0],W,H);
+  return build_frame(png);
+}
+
+// ─── BLE schrijven (alleen vanuit loop/main task aanroepen!) ──────────────────
+void ble_write_cmd(const uint8_t* data,size_t len){
+  if(!writeChr)return;
+  writeChr->writeValue(const_cast<uint8_t*>(data),len,false);
+  delay(50);
+}
+void ble_write_frame(const std::vector<uint8_t>& data){
+  if(!writeChr)return;
+  writeChr->writeValue(const_cast<uint8_t*>(data.data()),data.size(),true);
+}
+
+// ─── Notify callback — alleen vlaggen zetten, GEEN BLE writes ─────────────────
+void notifyCallback(BLERemoteCharacteristic* chr,uint8_t* data,size_t len,bool isNotify){
+  if(len<4)return;
+  Serial.printf("Notify [%d]: %02X %02X %02X %02X  (stage=%d)\n",
+                len,data[0],data[1],data[2],data[3],hsStage);
+
+  if(data[2]==0x01&&data[3]==0x80&&hsStage==1){
+    hsStage=2; doSendHS2=true;
+
+  }else if(data[2]==0x05&&data[3]==0x80&&hsStage==2){
+    hsStage=3; handshakeDone=true; doSendBrightness=true;
+    Serial.println("Handshake complete!");
+
+  }else if(len==5&&data[2]==0x02&&data[3]==0x00&&data[4]==0x03){
+    Serial.println("Frame ACK");
+    frameAck=true;
+  }
+}
+
+// ─── BLE verbinding opbouwen ──────────────────────────────────────────────────
+bool connectToDisplay(){
+  Serial.printf("Verbinden met %s...\n",DEVICE_MAC);
+  bleClient=BLEDevice::createClient();
+  if(!bleClient->connect(BLEAddress(DEVICE_MAC))){
+    Serial.println("Verbinding mislukt");return false;
+  }
+  Serial.println("BLE verbonden");
+
+  BLERemoteService* svc=bleClient->getService(SERVICE_UUID);
+  if(!svc){Serial.println("Service 0x00FA niet gevonden");bleClient->disconnect();return false;}
+
+  writeChr =svc->getCharacteristic(WRITE_UUID);
+  notifyChr=svc->getCharacteristic(NOTIFY_UUID);
+  if(!writeChr){Serial.println("Write char niet gevonden");bleClient->disconnect();return false;}
+
+  if(notifyChr&&notifyChr->canNotify()){
+    notifyChr->registerForNotify(notifyCallback);
+    Serial.println("Notify geregistreerd");
+  }
+
+  // Wacht even zodat eventuele welkomst-notify al binnenkomt vóór we starten
+  delay(300);
+
+  connected=true;
+  hsStage=1;
+  handshakeDone=false;
+  doSendHS2=false;
+  doSendBrightness=false;
+  frameAck=true;
+
+  ble_write_cmd(HANDSHAKE_1,8);
+  Serial.println("Handshake stap 1 verstuurd");
+  return true;
+}
 
 
 /*
@@ -239,113 +557,7 @@ void btnGreenISR() {
 }
 
 
-//////////////////
-/// webserver ///
-/////////////////
 
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ledstrip Game</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            color: white;
-        }
-        .container {
-            text-align: center;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 20px;
-            backdrop-filter: blur(10px);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-            min-width: 300px;
-        }
-        h1 { font-size: 2.5em; margin-bottom: 40px; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
-        .score-container { margin: 30px 0; }
-        .punten {
-            font-size: 6em; font-weight: bold; color: #ffd700;
-            text-shadow: 3px 3px 6px rgba(0,0,0,0.5);
-            margin: 20px 0; transition: transform 0.3s ease;
-        }
-        .punten.update { transform: scale(1.1); }
-        .level { font-size: 2em; color: #87ceeb; margin: 15px 0; transition: transform 0.3s ease; }
-        .level.update { transform: scale(1.1); }
-        .label { font-size: 1.2em; opacity: 0.9; margin-bottom: 5px; }
-        .status { margin-top: 30px; padding: 10px; border-radius: 10px; font-size: 0.9em; }
-        .status.connected { background: rgba(0,255,0,0.2); color: #90EE90; }
-        .status.disconnected { background: rgba(255,0,0,0.2); color: #FFB6C1; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎮 Ledstrip Game</h1>
-        <div class="score-container">
-            <div class="label">PUNTEN</div>
-            <div class="punten" id="punten">0</div>
-        </div>
-        <div class="score-container">
-            <div class="label">LEVEL</div>
-            <div class="level" id="level">1</div>
-        </div>
-        <div class="status disconnected" id="status">Verbinding maken...</div>
-    </div>
-    <script>
-        let websocket;
-        let reconnectInterval;
-        function initWebSocket() {
-            if (websocket && websocket.readyState === WebSocket.CONNECTING) return; // FIX: geen dubbele verbinding
-            websocket = new WebSocket('ws://' + window.location.hostname + '/ws');
-            websocket.onopen = function() {
-                document.getElementById('status').className = 'status connected';
-                document.getElementById('status').textContent = '✓ Verbonden';
-                clearInterval(reconnectInterval);
-                // FIX: heartbeat elke 5s zodat ESP verbinding actief houdt
-                clearInterval(window._hb);
-                window._hb = setInterval(function() {
-                    if (websocket.readyState === WebSocket.OPEN) websocket.send('ping');
-                }, 5000);
-            };
-            websocket.onclose = function() {
-                document.getElementById('status').className = 'status disconnected';
-                document.getElementById('status').textContent = '✗ Verbinding verbroken - Opnieuw verbinden...';
-                clearInterval(window._hb);
-                clearInterval(reconnectInterval);
-                reconnectInterval = setInterval(initWebSocket, 500); // FIX: was 2000ms, nu 500ms
-            };
-            websocket.onmessage = function(event) {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.punten !== undefined) {
-                        const el = document.getElementById('punten');
-                        el.textContent = data.punten;
-                        el.classList.add('update');
-                        setTimeout(() => el.classList.remove('update'), 300);
-                    }
-                    if (data.level !== undefined) {
-                        const el = document.getElementById('level');
-                        el.textContent = data.level;
-                        el.classList.add('update');
-                        setTimeout(() => el.classList.remove('update'), 300);
-                    }
-                } catch(e) { console.error('Fout:', e); }
-            };
-        }
-        initWebSocket();
-    </script>
-</body>
-</html>
-)rawliteral";
 
 
 // Functie declaraties
@@ -426,40 +638,42 @@ void setup() {
   ButtonLedsOff();
   randomSeed(analogRead(0));
 
-  // FIX: WiFi mode expliciet instellen vóór softAP
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(
-    IPAddress(192, 168, 4, 1),
-    IPAddress(192, 168, 4, 1),
-    IPAddress(255, 255, 255, 0)
-  );
-  // FIX: kanaal 6, max 4 clients, hidden=false
-  WiFi.softAP(ssid, password, 6, 0, 4);
-
-  // FIX: wacht tot AP echt actief is (anders start server te vroeg)
-  unsigned long apStart = millis();
-  while (WiFi.softAPIP() == IPAddress(0,0,0,0) && millis() - apStart < 3000) {
-    delay(100);
-  }
-
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP gestart: "); Serial.println(ssid);
-  Serial.print("IP: "); Serial.println(IP);
-
-  ws.onEvent(onWsEvent);
-  server.addHandler(&ws);
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", index_html);
-  });
-  // FIX: 404 handler zodat browser niet blijft hangen bij onbekende paden
-  server.onNotFound([](AsyncWebServerRequest *request) {
-    request->redirect("/");
-  });
-  server.begin();
 
   // FIX: delay(3000) vervangen door non-blocking wacht via timer
   // Startup geluid speelt al via DFPlayer; geen blocking delay nodig
   playPhaseAudio(PHASE_IDLE);
+
+Serial.println("Pool Display Direct — opstarten");
+  BLEDevice::init("PoolController");
+
+  if(!connectToDisplay()){
+    Serial.println("Kan niet verbinden, herstart over 5s...");
+    delay(5000);ESP.restart();
+  }
+
+  // Wacht op handshake via loop (max 8 seconden)
+  uint32_t t=millis();
+  while(!handshakeDone&&millis()-t<8000){
+    // Verwerk vlaggen die de callback zette
+    if(doSendHS2){
+      doSendHS2=false;
+      delay(50);
+      Serial.println("Handshake stap 2 versturen...");
+      ble_write_cmd(HANDSHAKE_2,4);
+    }
+    delay(50);
+  }
+  if(!handshakeDone){
+    Serial.println("Handshake timeout, herstart...");
+    delay(1000);ESP.restart();
+  }
+
+  // Helderheid instellen
+  uint8_t bright[]={5,0,4,0x80,BRIGHTNESS};
+  ble_write_cmd(bright,5);
+  delay(100);
+  Serial.println("Klaar voor gebruik");
+
 }
 
 
@@ -470,6 +684,27 @@ void loop() {
     ws.cleanupClients();
     lastWsCleanup = millis();
   }
+
+  if(!bleClient||!bleClient->isConnected()){
+    Serial.println("BLE verbroken, herstart...");
+    delay(2000);ESP.restart();
+  }
+
+  // ── Sensorwaarden — vervang door je echte metingen ──────────────────
+  temp_ = 26.5;
+  ph_   = 7.2;
+  orp_  = 710;
+  // ─────────────────────────────────────────────────────────────────────
+
+  if(frameAck){
+    frameAck=false;
+    auto frame=make_display_frame();
+    Serial.printf("Frame sturen (%d bytes)\n",frame.size());
+    ble_write_frame(frame);
+  }
+
+  delay(5000);
+
 
   // Stuur audio-verzoek veilig buiten de game-update
   serviceAudio();
